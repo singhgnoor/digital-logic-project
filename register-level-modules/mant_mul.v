@@ -1,3 +1,4 @@
+// STAGE 3 - MODIFIED (see markers below)
 `timescale 1ns/1ps
 
 /*
@@ -12,5 +13,16 @@ module mant_mul (
     input  wire [31:0] b,
     output wire [63:0] p
 );
-    assign p = a * b;
+    // STAGE 3 CHANGE START: Vedic multiplier, behavioural '*' kept selectable for comparison
+    // STAGE 2 (old): assign p = a * b;
+    parameter USE_VEDIC = 1; // 1 -> vedic_32x32 (default), 0 -> behavioural '*'
+
+    generate
+        if (USE_VEDIC) begin : g_vedic
+            vedic_32x32 u_vedic (.a(a), .b(b), .p(p));
+        end else begin : g_star
+            assign p = a * b;
+        end
+    endgenerate
+    // STAGE 3 CHANGE END
 endmodule

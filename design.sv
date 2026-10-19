@@ -1,5 +1,8 @@
+// STAGE 3 - MODIFIED (see markers below)
 // Combined design.sv, having all register level modules
+// STAGE 3: also contains the new files full_adder.v, sub32.v, vedic_mul.v (appended at the end)
 
+// STAGE 3 - MODIFIED (see markers below)
 `timescale 1ns/1ps
 
 /*
@@ -14,7 +17,18 @@ module mant_mul (
     input  wire [31:0] b,
     output wire [63:0] p
 );
-    assign p = a * b;
+    // STAGE 3 CHANGE START: Vedic multiplier, behavioural '*' kept selectable for comparison
+    // STAGE 2 (old): assign p = a * b;
+    parameter USE_VEDIC = 1; // 1 -> vedic_32x32 (default), 0 -> behavioural '*'
+
+    generate
+        if (USE_VEDIC) begin : g_vedic
+            vedic_32x32 u_vedic (.a(a), .b(b), .p(p));
+        end else begin : g_star
+            assign p = a * b;
+        end
+    endgenerate
+    // STAGE 3 CHANGE END
 endmodule
 
 
@@ -46,6 +60,7 @@ module seed_lut (
     end
 endmodule
 
+
 `timescale 1ns/1ps
 
 /*
@@ -67,7 +82,6 @@ endmodule
 
 
 `timescale 1ns/1ps
-
 /*
 fp_round_pack -> normalize, round and pack the quotient
 
@@ -109,6 +123,7 @@ module fp_round_pack (
 endmodule
 
 
+// STAGE 3 - MODIFIED (see markers below)
 `timescale 1ns/1ps
 
 // Datapath (all unsigned fixed point, ONE shared 32x32 multiplier, FSM-sequenced)
@@ -172,7 +187,11 @@ module fp_div (
     seed_lut u_lut (.idx(mb[22:20]), .x0(x0));
 
     // using the standard multiplyier that is the there for the project
-    wire [31:0] t_w = 32'h8000_0000 - e_r; // 2 - e 
+    // STAGE 3 CHANGE START: 2 - e through the gate-level subtractor
+    // STAGE 2 (old): wire [31:0] t_w = 32'h8000_0000 - e_r; // 2 - e
+    wire [31:0] t_w; // 2 - e
+    sub32 u_sub (.a(32'h8000_0000), .b(e_r), .diff(t_w), .borrow());
+    // STAGE 3 CHANGE END
     reg  [31:0] mul_a, mul_b;
     wire [63:0] mul_p;
 
@@ -235,4 +254,197 @@ module fp_div (
             endcase
         end
     end
+endmodule
+
+
+// STAGE 3 - NEW FILE
+`timescale 1ns/1ps
+
+/*
+full_adder -> 1 bit full adder, gate level
+basic cell of sub32 (and of the CLA later)
+*/
+
+module full_adder (
+    input  wire a,
+    input  wire b,
+    input  wire cin,
+    output wire sum,
+    output wire cout
+);
+    assign sum  = a ^ b ^ cin;
+    assign cout = (a & b) | (cin & (a ^ b));
+endmodule
+
+
+// STAGE 3 - NEW FILE
+`timescale 1ns/1ps
+
+/*
+sub32 -> 32 bit subtractor made of 32 chained full adders (ripple carry)
+a - b = a + (~b) + 1   (two's complement, the +1 goes in as carry-in of bit 0)
+borrow = 1 when a < b  (i.e. no carry out of bit 31)
+used in fp_div for the  2 - e  step of the Newton Raphson iteration
+*/
+
+module sub32 (
+    input  wire [31:0] a,
+    input  wire [31:0] b,
+    output wire [31:0] diff,
+    output wire borrow
+);
+    wire [32:0] c; // carry chain, c[i] is carry into bit i
+
+    assign c[0] = 1'b1; // the +1 of two's complement
+
+    genvar i;
+    generate
+        for (i = 0; i < 32; i = i + 1) begin : g_fa
+            full_adder u_fa (.a(a[i]), .b(~b[i]), .cin(c[i]), .sum(diff[i]), .cout(c[i+1]));
+        end
+    endgenerate
+
+    assign borrow = ~c[32];
+endmodule
+
+
+// STAGE 3 - NEW FILE
+`timescale 1ns/1ps
+
+/*
+vedic_mul -> Vedic multiplier, Urdhva Tiryagbhyam ("vertically and crosswise")
+Base case vedic_2x2 is gate level (4 AND + 2 half adders).
+Every bigger block splits each operand into high/low halves and uses 4 smaller blocks:
+    q0 = aL*bL  (vertical)    q1 = aH*bL, q2 = aL*bH  (crosswise)    q3 = aH*bH  (vertical)
+    P  = q0 + ((q1 + q2) << n/2) + (q3 << n)
+vedic_32x32 -> used by mant_mul (v1 divider)
+vedic_24x24 -> 3 digit (8 bit) crosswise version for the FP mantissa (for v2 fp_mul, not wired yet)
+
+The combining adders use '+' for now, can be swapped for the CLA adders later.
+*/
+
+module ha (
+    input  wire a,
+    input  wire b,
+    output wire sum,
+    output wire carry
+);
+    assign sum   = a ^ b;
+    assign carry = a & b;
+endmodule
+
+
+module vedic_2x2 (
+    input  wire [1:0] a,
+    input  wire [1:0] b,
+    output wire [3:0] p
+);
+    wire c1;
+
+    assign p[0] = a[0] & b[0]; // vertical
+    ha u_h0 (.a(a[1] & b[0]), .b(a[0] & b[1]), .sum(p[1]), .carry(c1));   // crosswise
+    ha u_h1 (.a(a[1] & b[1]), .b(c1),          .sum(p[2]), .carry(p[3])); // vertical + carry
+endmodule
+
+
+module vedic_4x4 (
+    input  wire [3:0] a,
+    input  wire [3:0] b,
+    output wire [7:0] p
+);
+    wire [3:0] q0, q1, q2, q3;
+
+    vedic_2x2 u_m0 (.a(a[1:0]), .b(b[1:0]), .p(q0));
+    vedic_2x2 u_m1 (.a(a[3:2]), .b(b[1:0]), .p(q1));
+    vedic_2x2 u_m2 (.a(a[1:0]), .b(b[3:2]), .p(q2));
+    vedic_2x2 u_m3 (.a(a[3:2]), .b(b[3:2]), .p(q3));
+
+    wire [4:0] mid = q1 + q2; // one extra bit for the carry
+    assign p = q0 + (mid << 2) + (q3 << 4);
+endmodule
+
+
+module vedic_8x8 (
+    input  wire [7:0]  a,
+    input  wire [7:0]  b,
+    output wire [15:0] p
+);
+    wire [7:0] q0, q1, q2, q3;
+
+    vedic_4x4 u_m0 (.a(a[3:0]), .b(b[3:0]), .p(q0));
+    vedic_4x4 u_m1 (.a(a[7:4]), .b(b[3:0]), .p(q1));
+    vedic_4x4 u_m2 (.a(a[3:0]), .b(b[7:4]), .p(q2));
+    vedic_4x4 u_m3 (.a(a[7:4]), .b(b[7:4]), .p(q3));
+
+    wire [8:0] mid = q1 + q2;
+    assign p = q0 + (mid << 4) + (q3 << 8);
+endmodule
+
+
+module vedic_16x16 (
+    input  wire [15:0] a,
+    input  wire [15:0] b,
+    output wire [31:0] p
+);
+    wire [15:0] q0, q1, q2, q3;
+
+    vedic_8x8 u_m0 (.a(a[7:0]),  .b(b[7:0]),  .p(q0));
+    vedic_8x8 u_m1 (.a(a[15:8]), .b(b[7:0]),  .p(q1));
+    vedic_8x8 u_m2 (.a(a[7:0]),  .b(b[15:8]), .p(q2));
+    vedic_8x8 u_m3 (.a(a[15:8]), .b(b[15:8]), .p(q3));
+
+    wire [16:0] mid = q1 + q2;
+    assign p = q0 + (mid << 8) + (q3 << 16);
+endmodule
+
+
+module vedic_32x32 (
+    input  wire [31:0] a,
+    input  wire [31:0] b,
+    output wire [63:0] p
+);
+    wire [31:0] q0, q1, q2, q3;
+
+    vedic_16x16 u_m0 (.a(a[15:0]),  .b(b[15:0]),  .p(q0));
+    vedic_16x16 u_m1 (.a(a[31:16]), .b(b[15:0]),  .p(q1));
+    vedic_16x16 u_m2 (.a(a[15:0]),  .b(b[31:16]), .p(q2));
+    vedic_16x16 u_m3 (.a(a[31:16]), .b(b[31:16]), .p(q3));
+
+    wire [32:0] mid = q1 + q2;
+    assign p = q0 + (mid << 16) + (q3 << 32);
+endmodule
+
+
+/*
+vedic_24x24 -> each operand as 3 digits of 8 bits, a = {aH, aM, aL}
+nine vedic_8x8, one column at a time (same as 123 x 456 by hand):
+    col0 = aL*bL
+    col1 = aM*bL + aL*bM
+    col2 = aH*bL + aM*bM + aL*bH
+    col3 = aH*bM + aM*bH
+    col4 = aH*bH
+    P = col0 + (col1 << 8) + (col2 << 16) + (col3 << 24) + (col4 << 32)
+*/
+
+module vedic_24x24 (
+    input  wire [23:0] a,
+    input  wire [23:0] b,
+    output wire [47:0] p
+);
+    wire [15:0] ll, ml, lm, hl, mm, lh, hm, mh, hh; // first letter -> digit of a, second -> digit of b
+
+    vedic_8x8 u_ll (.a(a[7:0]),   .b(b[7:0]),   .p(ll));
+    vedic_8x8 u_ml (.a(a[15:8]),  .b(b[7:0]),   .p(ml));
+    vedic_8x8 u_lm (.a(a[7:0]),   .b(b[15:8]),  .p(lm));
+    vedic_8x8 u_hl (.a(a[23:16]), .b(b[7:0]),   .p(hl));
+    vedic_8x8 u_mm (.a(a[15:8]),  .b(b[15:8]),  .p(mm));
+    vedic_8x8 u_lh (.a(a[7:0]),   .b(b[23:16]), .p(lh));
+    vedic_8x8 u_hm (.a(a[23:16]), .b(b[15:8]),  .p(hm));
+    vedic_8x8 u_mh (.a(a[15:8]),  .b(b[23:16]), .p(mh));
+    vedic_8x8 u_hh (.a(a[23:16]), .b(b[23:16]), .p(hh));
+
+    wire [16:0] col1 = ml + lm;      // 2 terms -> 1 extra bit
+    wire [17:0] col2 = hl + mm + lh; // 3 terms -> 2 extra bits
+    wire [16:0] col3 = hm + mh;
+    assign p = ll + (col1 << 8) + (col2 << 16) + (col3 << 24) + (hh << 32);
 endmodule

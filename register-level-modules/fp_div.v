@@ -1,3 +1,4 @@
+// STAGE 3 - MODIFIED (see markers below)
 `timescale 1ns/1ps
 
 // Datapath (all unsigned fixed point, ONE shared 32x32 multiplier, FSM-sequenced)
@@ -61,7 +62,11 @@ module fp_div (
     seed_lut u_lut (.idx(mb[22:20]), .x0(x0));
 
     // using the standard multiplyier that is the there for the project
-    wire [31:0] t_w = 32'h8000_0000 - e_r; // 2 - e 
+    // STAGE 3 CHANGE START: 2 - e through the gate-level subtractor
+    // STAGE 2 (old): wire [31:0] t_w = 32'h8000_0000 - e_r; // 2 - e
+    wire [31:0] t_w; // 2 - e
+    sub32 u_sub (.a(32'h8000_0000), .b(e_r), .diff(t_w), .borrow());
+    // STAGE 3 CHANGE END
     reg  [31:0] mul_a, mul_b;
     wire [63:0] mul_p;
 
