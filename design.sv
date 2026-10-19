@@ -1,6 +1,6 @@
 // STAGE 3 - MODIFIED (see markers below)
 // Combined design.sv, having all register level modules
-// STAGE 3: also contains the new files full_adder.v, sub32.v, vedic_mul.v (appended at the end)
+// STAGE 3: also contains the new files full_adder.v, cla8.v, sub32.v, vedic_mul.v (appended at the end)
 
 // STAGE 3 - MODIFIED (see markers below)
 `timescale 1ns/1ps
@@ -281,8 +281,51 @@ endmodule
 `timescale 1ns/1ps
 
 /*
-sub32 -> 32 bit subtractor made of 32 chained full adders (ripple carry)
-a - b = a + (~b) + 1   (two's complement, the +1 goes in as carry-in of bit 0)
+cla8 -> 8 bit carry look ahead adder, gate level
+g = a & b (bit generates a carry),  p = a ^ b (bit passes the carry in to the next bit)
+every carry is written directly from g, p and cin, so no carry waits for the previous one:
+    c[i+1] = g[i] | p[i]&g[i-1] | p[i]&p[i-1]&g[i-2] | ... | p[i]&...&p[0]&cin
+sum = p ^ c
+building block of sub32 (4 of these, carry rippling between the blocks)
+*/
+
+module cla8 (
+    input  wire [7:0] a,
+    input  wire [7:0] b,
+    input  wire cin,
+    output wire [7:0] sum,
+    output wire cout
+);
+    wire [7:0] g = a & b; // generate
+    wire [7:0] p = a ^ b; // propagate
+    wire [8:0] c;
+
+    assign c[0] = cin;
+    assign c[1] = g[0] | (p[0] & cin);
+    assign c[2] = g[1] | (p[1] & g[0]) | (&p[1:0] & cin);
+    assign c[3] = g[2] | (p[2] & g[1]) | (&p[2:1] & g[0]) | (&p[2:0] & cin);
+    assign c[4] = g[3] | (p[3] & g[2]) | (&p[3:2] & g[1]) | (&p[3:1] & g[0]) | (&p[3:0] & cin);
+    assign c[5] = g[4] | (p[4] & g[3]) | (&p[4:3] & g[2]) | (&p[4:2] & g[1]) | (&p[4:1] & g[0])
+                | (&p[4:0] & cin);
+    assign c[6] = g[5] | (p[5] & g[4]) | (&p[5:4] & g[3]) | (&p[5:3] & g[2]) | (&p[5:2] & g[1])
+                | (&p[5:1] & g[0]) | (&p[5:0] & cin);
+    assign c[7] = g[6] | (p[6] & g[5]) | (&p[6:5] & g[4]) | (&p[6:4] & g[3]) | (&p[6:3] & g[2])
+                | (&p[6:2] & g[1]) | (&p[6:1] & g[0]) | (&p[6:0] & cin);
+    assign c[8] = g[7] | (p[7] & g[6]) | (&p[7:6] & g[5]) | (&p[7:5] & g[4]) | (&p[7:4] & g[3])
+                | (&p[7:3] & g[2]) | (&p[7:2] & g[1]) | (&p[7:1] & g[0]) | (&p[7:0] & cin);
+
+    assign sum  = p ^ c[7:0];
+    assign cout = c[8];
+endmodule
+
+
+// STAGE 3 - NEW FILE
+`timescale 1ns/1ps
+
+/*
+sub32 -> 32 bit subtractor, hybrid adder: four 8 bit CLA blocks (cla8),
+carry ripples from one block to the next (look ahead inside a block, ripple between blocks)
+a - b = a + (~b) + 1   (two's complement, the +1 goes in as carry-in of the first block)
 borrow = 1 when a < b  (i.e. no carry out of bit 31)
 used in fp_div for the  2 - e  step of the Newton Raphson iteration
 */
@@ -293,18 +336,18 @@ module sub32 (
     output wire [31:0] diff,
     output wire borrow
 );
-    wire [32:0] c; // carry chain, c[i] is carry into bit i
+    wire [4:0] c; // carry between the blocks, c[k] is carry into block k
 
     assign c[0] = 1'b1; // the +1 of two's complement
 
-    genvar i;
+    genvar k;
     generate
-        for (i = 0; i < 32; i = i + 1) begin : g_fa
-            full_adder u_fa (.a(a[i]), .b(~b[i]), .cin(c[i]), .sum(diff[i]), .cout(c[i+1]));
+        for (k = 0; k < 4; k = k + 1) begin : g_cla
+            cla8 u_cla (.a(a[8*k+7:8*k]), .b(~b[8*k+7:8*k]), .cin(c[k]), .sum(diff[8*k+7:8*k]), .cout(c[k+1]));
         end
     endgenerate
 
-    assign borrow = ~c[32];
+    assign borrow = ~c[4];
 endmodule
 
 

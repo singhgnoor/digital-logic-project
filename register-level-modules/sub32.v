@@ -2,8 +2,9 @@
 `timescale 1ns/1ps
 
 /*
-sub32 -> 32 bit subtractor made of 32 chained full adders (ripple carry)
-a - b = a + (~b) + 1   (two's complement, the +1 goes in as carry-in of bit 0)
+sub32 -> 32 bit subtractor, hybrid adder: four 8 bit CLA blocks (cla8),
+carry ripples from one block to the next (look ahead inside a block, ripple between blocks)
+a - b = a + (~b) + 1   (two's complement, the +1 goes in as carry-in of the first block)
 borrow = 1 when a < b  (i.e. no carry out of bit 31)
 used in fp_div for the  2 - e  step of the Newton Raphson iteration
 */
@@ -14,16 +15,16 @@ module sub32 (
     output wire [31:0] diff,
     output wire borrow
 );
-    wire [32:0] c; // carry chain, c[i] is carry into bit i
+    wire [4:0] c; // carry between the blocks, c[k] is carry into block k
 
     assign c[0] = 1'b1; // the +1 of two's complement
 
-    genvar i;
+    genvar k;
     generate
-        for (i = 0; i < 32; i = i + 1) begin : g_fa
-            full_adder u_fa (.a(a[i]), .b(~b[i]), .cin(c[i]), .sum(diff[i]), .cout(c[i+1]));
+        for (k = 0; k < 4; k = k + 1) begin : g_cla
+            cla8 u_cla (.a(a[8*k+7:8*k]), .b(~b[8*k+7:8*k]), .cin(c[k]), .sum(diff[8*k+7:8*k]), .cout(c[k+1]));
         end
     endgenerate
 
-    assign borrow = ~c[32];
+    assign borrow = ~c[4];
 endmodule
