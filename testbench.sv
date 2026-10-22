@@ -36,7 +36,7 @@ module tb_fp_div;
     reg [31:0] exp_q;
     reg [31:0] last_x;
 
-    // STAGE 3 CHANGE START: directed special-case vectors {A, B, expected result, expected flags}
+    // Stage 3 change: directed special-case vectors {A, B, expected result, expected flags}
     localparam integer NSPEC = 25;
     reg [99:0] spec [0:NSPEC-1];
     integer k, n_spec_fail;
@@ -69,7 +69,6 @@ module tb_fp_div;
         spec[23] = {32'h7149_F2CA, 32'h0DA2_4260, 32'h7F80_0000, 4'b0010}; // 1e30 / 1e-30 -> +Inf, overflow
         spec[24] = {32'h0DA2_4260, 32'h7149_F2CA, 32'h0000_0000, 4'b0001}; // 1e-30 / 1e30 -> +0, underflow (FTZ)
     end
-    // STAGE 3 CHANGE END
 
     // print the guess after every NR step (convergence monitoring)
     always @(posedge clk)
@@ -126,7 +125,7 @@ module tb_fp_div;
                          n, a, b, result, exp_q, err, cycles, (err > 1) ? "<-- MISMATCH" : "");
         end
 
-        // STAGE 3 CHANGE START: special-case section (exact bit match + flags + latency)
+        // Stage 3 : special-case section (exact bit match + flags + latency)
         $display("\n\t\t\tSpecial cases\n");
         n_spec_fail = 0;
         for (k = 0; k < NSPEC; k = k + 1) begin
@@ -149,7 +148,6 @@ module tb_fp_div;
                      k, a, b, result, exp_q, flags, exp_f, cycles,
                      (result !== exp_q || flags !== exp_f) ? "<-- MISMATCH" : "ok");
         end
-        // STAGE 3 CHANGE END
 
         $display("\n\n\t\t\tFinal Results\n");
         $display("Vectors : %0d      NR iterations : %0d      latency : %0d cycles", nvec, iters, lat_first);
