@@ -1,6 +1,7 @@
 // STAGE 3 - MODIFIED (see markers below)
 // Combined design.sv, having all register level modules
 // STAGE 3: also contains the new files full_adder.v, cla8.v, sub32.v, vedic_mul.v (appended at the end)
+// STAGE 3: fp_unpack / fp_div / fp_round_pack updated for special cases (NaN, Inf, zero, subnormal) + exception flags
 
 // STAGE 3 - MODIFIED (see markers below)
 `timescale 1ns/1ps
@@ -64,20 +65,46 @@ endmodule
 `timescale 1ns/1ps
 
 /*
-fp_unpack -> split IEEE754 single precision into {sing, exponent, 24bit mantissa}
-Stage2 unpacks normal numbers only!!!
-Stage3 plan will implement special case detection i.e. zero, infinity, other cases
+fp_unpack -> split IEEE754 single precision into {sign, exponent, 24bit mantissa}
+             and classify the operand
+STAGE 3: special case detection added (zero, subnormal, infinity, NaN)
+
+   exp      frac    class
+   0        0       zero        (+0 / -0)
+   0        !=0     subnormal   (treated as zero by fp_div -> DAZ)
+   1..254   any     normal      (hidden bit = 1)
+   255      0       infinity
+   255      !=0     NaN         (frac[22] = 1 -> quiet, 0 -> signalling)
 */
 
 module fp_unpack (
     input  wire [31:0] x,
     output wire        sign,
     output wire [7:0]  exp,
-    output wire [23:0] mant      // {1, fraction}, value = mant / 2^23, in [1,2)
+    output wire [23:0] mant,     // {hidden, fraction}, value = mant / 2^23, in [1,2) for normals
+    // STAGE 3 CHANGE START: operand classification
+    output wire        is_zero,
+    output wire        is_sub,
+    output wire        is_inf,
+    output wire        is_nan
+    // STAGE 3 CHANGE END
 );
     assign sign = x[31];
     assign exp  = x[30:23];
-    assign mant = {1'b1, x[22:0]};
+
+    // STAGE 3 CHANGE START: classification + correct hidden bit
+    // STAGE 2 (old): assign mant = {1'b1, x[22:0]};
+    wire exp_zero  = ~|x[30:23];   // exponent all 0s
+    wire exp_ones  =  &x[30:23];   // exponent all 1s
+    wire frac_zero = ~|x[22:0];
+
+    assign is_zero = exp_zero &  frac_zero;
+    assign is_sub  = exp_zero & ~frac_zero;
+    assign is_inf  = exp_ones &  frac_zero;
+    assign is_nan  = exp_ones & ~frac_zero;
+
+    assign mant = {~exp_zero, x[22:0]};   // hidden bit is 0 for zero / subnormal
+    // STAGE 3 CHANGE END
 endmodule
 
 
@@ -91,7 +118,8 @@ so prod = 2*ratio * 2^53, ratio = mant_a/mant_b in (0.5, 2)
 ratio >= 1  -> leading 1 at prod[54]
 ratio <  1  -> leading 1 at prod[53]
 exp_base = expA - expB + 127 (int base 10, for understanding)
-Overflow -> Inf, underflow -> flushed to zero (subnormal results not supported yet).
+Overflow -> Inf, underflow -> flushed to zero (FTZ, subnormal results are not produced).
+STAGE 3: only normal operands reach this block, fp_div handles zero / Inf / NaN / subnormal inputs.
 */
 
 module fp_round_pack (
@@ -136,6 +164,8 @@ endmodule
 //   S_X : x  = x * (2 - e)
 //   S_Q : P  = mant_A * x
 //   S_OUT: normalise / round / pack, raise 'done' for one cycle
+// STAGE 3: special operands (NaN / Inf / zero / subnormal) bypass the NR loop:
+//   IDLE --start & special--> IDLE   (result + done on the next clock edge, 1 cycle latency)
 
 /*
 fp_div -> IEEE754 single-precision divider using Newton Raphson reciprocal.
@@ -143,7 +173,14 @@ Required ans = A * (1/B)
 Newton-Raphson iteration : x(n+1) = x(n) * (2-d*x(n))       
                             : d -> normalised mantissa (mantissa of B/2) in [0.5, 1)
 
-Stage2 scope is normal inputs only (Special cases zero, inf, other not handeled yet)
+STAGE 3: special cases handled (priority order, top wins)
+   1. A or B is NaN           -> NaN (input NaN propagated and made quiet, A has priority)
+   2. 0/0  or  Inf/Inf        -> default quiet NaN 0x7FC00000          (invalid)
+   3. Inf/finite              -> +-Inf
+   4. nonzero finite / 0      -> +-Inf                                 (div_by_zero)
+   5. 0/nonzero  or  finite/Inf -> +-0
+   sign of Inf / zero results = signA ^ signB
+Subnormal inputs are treated as zero (DAZ) and subnormal results are flushed to zero (FTZ).
 
 */
 
@@ -157,6 +194,9 @@ module fp_div (
     output reg  [31:0] result,
     output reg done, // 1-cycle pulse, result valid
     output wire busy,
+    // STAGE 3 CHANGE START: IEEE exception flags, valid together with 'done'
+    output reg  [3:0]  flags, // {invalid, div_by_zero, overflow, underflow}
+    // STAGE 3 CHANGE END
     // debug or analysis
     output wire [31:0] x_dbg, // current reciprocal estimate, for convergence monitoring
     output wire [2:0]  iter_dbg
@@ -179,8 +219,36 @@ module fp_div (
     wire sa, sb;
     wire [7:0]  ea, eb;
     wire [23:0] ma, mb;
-    fp_unpack u_a (.x(a), .sign(sa), .exp(ea), .mant(ma));
-    fp_unpack u_b (.x(b), .sign(sb), .exp(eb), .mant(mb));
+    // STAGE 3 CHANGE START: operand classification + special-case result
+    // STAGE 2 (old): fp_unpack u_a (.x(a), .sign(sa), .exp(ea), .mant(ma));
+    // STAGE 2 (old): fp_unpack u_b (.x(b), .sign(sb), .exp(eb), .mant(mb));
+    wire za, suba, infa, nana;
+    wire zb, subb, infb, nanb;
+    fp_unpack u_a (.x(a), .sign(sa), .exp(ea), .mant(ma),
+                   .is_zero(za), .is_sub(suba), .is_inf(infa), .is_nan(nana));
+    fp_unpack u_b (.x(b), .sign(sb), .exp(eb), .mant(mb),
+                   .is_zero(zb), .is_sub(subb), .is_inf(infb), .is_nan(nanb));
+
+    wire a_zero = za | suba;   // DAZ: subnormal input counts as zero
+    wire b_zero = zb | subb;
+    wire s_q    = sa ^ sb;
+
+    wire r_nan  = nana | nanb | (a_zero & b_zero) | (infa & infb);
+    wire r_inf  = ~r_nan & (infa | b_zero);
+    wire r_zero = ~r_nan & ~r_inf & (a_zero | infb);
+    wire special = r_nan | r_inf | r_zero;   // any of these -> skip the NR datapath
+
+    wire invalid_w = (nana & ~a[22]) | (nanb & ~b[22])     // signalling NaN input
+                   | (a_zero & b_zero) | (infa & infb);    // 0/0, Inf/Inf
+    wire dbz_w     = b_zero & ~a_zero & ~infa & ~nana & ~nanb; // finite nonzero / 0
+
+    wire [31:0] nan_w = nana ? {a[31:23], 1'b1, a[21:0]} :   // propagate A (quietened)
+                        nanb ? {b[31:23], 1'b1, b[21:0]} :   // else propagate B
+                               32'h7FC0_0000;                // else default quiet NaN
+    wire [31:0] special_val = r_nan ? nan_w :
+                              r_inf ? {s_q, 8'hFF, 23'd0} :
+                                      {s_q, 31'd0};
+    // STAGE 3 CHANGE END
 
     // get the x0 from look up table
     wire [31:0] x0;
@@ -219,19 +287,30 @@ module fp_div (
             done   <= 1'b0;
             result <= 32'd0;
             iter   <= 3'd0;
+            flags  <= 4'd0;   // STAGE 3
         end else begin
             done <= 1'b0;
             case (state)
+                // STAGE 3 CHANGE START: special operands answered directly from IDLE
+                // STAGE 2 (old): IDLE: if (start) begin <load regs, go to S_E / S_Q> end
                 IDLE: if (start) begin
-                    sign_r <= sa ^ sb;
-                    ea_r   <= ea;
-                    eb_r   <= eb;
-                    ma_r   <= ma;
-                    d_r    <= {mb, 7'b0};
-                    x_r    <= x0;
-                    iter   <= 3'd0;
-                    state  <= (num_iter == 3'd0) ? S_Q : S_E;
+                    if (special) begin
+                        result <= special_val;
+                        flags  <= {invalid_w, dbz_w, 2'b00};
+                        done   <= 1'b1;
+                        state  <= IDLE;
+                    end else begin
+                        sign_r <= s_q;
+                        ea_r   <= ea;
+                        eb_r   <= eb;
+                        ma_r   <= ma;
+                        d_r    <= {mb, 7'b0};
+                        x_r    <= x0;
+                        iter   <= 3'd0;
+                        state  <= (num_iter == 3'd0) ? S_Q : S_E;
+                    end
                 end
+                // STAGE 3 CHANGE END
                 S_E: begin
                     e_r   <= mul_p[62:31];
                     state <= S_X;
@@ -247,6 +326,7 @@ module fp_div (
                 end
                 S_OUT: begin
                     result <= res_w;
+                    flags  <= {2'b00, ovf_w, unf_w};   // STAGE 3
                     done   <= 1'b1;
                     state  <= IDLE;
                 end

@@ -8,7 +8,8 @@ so prod = 2*ratio * 2^53, ratio = mant_a/mant_b in (0.5, 2)
 ratio >= 1  -> leading 1 at prod[54]
 ratio <  1  -> leading 1 at prod[53]
 exp_base = expA - expB + 127 (int base 10, for understanding)
-Overflow -> Inf, underflow -> flushed to zero (subnormal results not supported yet).
+Overflow -> Inf, underflow -> flushed to zero (FTZ, subnormal results are not produced).
+STAGE 3: only normal operands reach this block, fp_div handles zero / Inf / NaN / subnormal inputs.
 */
 
 module fp_round_pack (
