@@ -1,9 +1,6 @@
-// STAGE 3 - MODIFIED (see markers below)
 // Combined design.sv, having all register level modules
-// STAGE 3: also contains the new files full_adder.v, cla8.v, sub32.v, vedic_mul.v (appended at the end)
 // STAGE 3: fp_unpack / fp_div / fp_round_pack updated for special cases (NaN, Inf, zero, subnormal) + exception flags
 
-// STAGE 3 - MODIFIED (see markers below)
 `timescale 1ns/1ps
 
 /*
@@ -82,18 +79,14 @@ module fp_unpack (
     output wire        sign,
     output wire [7:0]  exp,
     output wire [23:0] mant,     // {hidden, fraction}, value = mant / 2^23, in [1,2) for normals
-    // STAGE 3 CHANGE START: operand classification
     output wire        is_zero,
     output wire        is_sub,
     output wire        is_inf,
     output wire        is_nan
-    // STAGE 3 CHANGE END
 );
     assign sign = x[31];
     assign exp  = x[30:23];
 
-    // STAGE 3 CHANGE START: classification + correct hidden bit
-    // STAGE 2 (old): assign mant = {1'b1, x[22:0]};
     wire exp_zero  = ~|x[30:23];   // exponent all 0s
     wire exp_ones  =  &x[30:23];   // exponent all 1s
     wire frac_zero = ~|x[22:0];
@@ -104,7 +97,6 @@ module fp_unpack (
     assign is_nan  = exp_ones & ~frac_zero;
 
     assign mant = {~exp_zero, x[22:0]};   // hidden bit is 0 for zero / subnormal
-    // STAGE 3 CHANGE END
 endmodule
 
 
@@ -151,7 +143,6 @@ module fp_round_pack (
 endmodule
 
 
-// STAGE 3 - MODIFIED (see markers below)
 `timescale 1ns/1ps
 
 // Datapath (all unsigned fixed point, ONE shared 32x32 multiplier, FSM-sequenced)
@@ -194,9 +185,7 @@ module fp_div (
     output reg  [31:0] result,
     output reg done, // 1-cycle pulse, result valid
     output wire busy,
-    // STAGE 3 CHANGE START: IEEE exception flags, valid together with 'done'
     output reg  [3:0]  flags, // {invalid, div_by_zero, overflow, underflow}
-    // STAGE 3 CHANGE END
     // debug or analysis
     output wire [31:0] x_dbg, // current reciprocal estimate, for convergence monitoring
     output wire [2:0]  iter_dbg
@@ -219,9 +208,6 @@ module fp_div (
     wire sa, sb;
     wire [7:0]  ea, eb;
     wire [23:0] ma, mb;
-    // STAGE 3 CHANGE START: operand classification + special-case result
-    // STAGE 2 (old): fp_unpack u_a (.x(a), .sign(sa), .exp(ea), .mant(ma));
-    // STAGE 2 (old): fp_unpack u_b (.x(b), .sign(sb), .exp(eb), .mant(mb));
     wire za, suba, infa, nana;
     wire zb, subb, infb, nanb;
     fp_unpack u_a (.x(a), .sign(sa), .exp(ea), .mant(ma),
@@ -248,18 +234,14 @@ module fp_div (
     wire [31:0] special_val = r_nan ? nan_w :
                               r_inf ? {s_q, 8'hFF, 23'd0} :
                                       {s_q, 31'd0};
-    // STAGE 3 CHANGE END
 
     // get the x0 from look up table
     wire [31:0] x0;
     seed_lut u_lut (.idx(mb[22:20]), .x0(x0));
 
     // using the standard multiplyier that is the there for the project
-    // STAGE 3 CHANGE START: 2 - e through the gate-level subtractor
-    // STAGE 2 (old): wire [31:0] t_w = 32'h8000_0000 - e_r; // 2 - e
     wire [31:0] t_w; // 2 - e
     sub32 u_sub (.a(32'h8000_0000), .b(e_r), .diff(t_w), .borrow());
-    // STAGE 3 CHANGE END
     reg  [31:0] mul_a, mul_b;
     wire [63:0] mul_p;
 
@@ -291,8 +273,6 @@ module fp_div (
         end else begin
             done <= 1'b0;
             case (state)
-                // STAGE 3 CHANGE START: special operands answered directly from IDLE
-                // STAGE 2 (old): IDLE: if (start) begin <load regs, go to S_E / S_Q> end
                 IDLE: if (start) begin
                     if (special) begin
                         result <= special_val;
@@ -310,7 +290,6 @@ module fp_div (
                         state  <= (num_iter == 3'd0) ? S_Q : S_E;
                     end
                 end
-                // STAGE 3 CHANGE END
                 S_E: begin
                     e_r   <= mul_p[62:31];
                     state <= S_X;
@@ -337,7 +316,6 @@ module fp_div (
 endmodule
 
 
-// STAGE 3 - NEW FILE
 `timescale 1ns/1ps
 
 /*
@@ -357,7 +335,6 @@ module full_adder (
 endmodule
 
 
-// STAGE 3 - NEW FILE
 `timescale 1ns/1ps
 
 /*
@@ -399,7 +376,6 @@ module cla8 (
 endmodule
 
 
-// STAGE 3 - NEW FILE
 `timescale 1ns/1ps
 
 /*
@@ -431,7 +407,6 @@ module sub32 (
 endmodule
 
 
-// STAGE 3 - NEW FILE
 `timescale 1ns/1ps
 
 /*
