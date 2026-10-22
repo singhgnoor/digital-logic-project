@@ -28,6 +28,3 @@ model/golden_model.cpp  bit-accurate C++ model + vector generator
 ## vedic and sub32 tests (from sim/)
     iverilog -g2005 -o vedic.out ../register-level-modules/vedic_mul.v ../testbench/tb_vedic.v && vvp vedic.out
     iverilog -g2005 -o sub32.out ../register-level-modules/sub32.v ../register-level-modules/cla8.v ../testbench/tb_sub32.v && vvp sub32.out
-
-## Not done yet: special cases (zero/inf/nan/subnormal), the '+' inside the vedic blocks is still
-## behavioural, vedic_24x24 not wired in yet, pipelining.
