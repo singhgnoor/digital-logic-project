@@ -1,4 +1,3 @@
-// STAGE 3 - MODIFIED (see markers below)
 `timescale 1ns/1ps
 
 // Datapath (all unsigned fixed point, ONE shared 32x32 multiplier, FSM-sequenced)

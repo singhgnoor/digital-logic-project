@@ -1,4 +1,3 @@
-// STAGE 3 - NEW FILE
 `timescale 1ns/1ps
 
 /*

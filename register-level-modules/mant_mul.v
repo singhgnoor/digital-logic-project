@@ -1,4 +1,3 @@
-// STAGE 3 - MODIFIED (see markers below)
 `timescale 1ns/1ps
 
 /*
