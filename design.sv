@@ -1,5 +1,6 @@
 // Combined design.sv, having all register level modules
 // STAGE 3: fp_unpack / fp_div / fp_round_pack updated for special cases (NaN, Inf, zero, subnormal) + exception flags
+// STAGE 4: seed modes, convergence monitor, sqrt, fault injection (seed_linear, rsqrt_lut, sqrt_pack, conv_monitor added)
 
 `timescale 1ns/1ps
 
@@ -15,8 +16,7 @@ module mant_mul (
     input  wire [31:0] b,
     output wire [63:0] p
 );
-    // STAGE 3 CHANGE START: Vedic multiplier, behavioural '*' kept selectable for comparison
-    // STAGE 2 (old): assign p = a * b;
+    // STAGE 3: Vedic multiplier, behavioural '*' kept selectable for comparison
     parameter USE_VEDIC = 1; // 1 -> vedic_32x32 (default), 0 -> behavioural '*'
 
     generate
@@ -26,7 +26,6 @@ module mant_mul (
             assign p = a * b;
         end
     endgenerate
-    // STAGE 3 CHANGE END
 endmodule
 
 
@@ -62,6 +61,95 @@ endmodule
 `timescale 1ns/1ps
 
 /*
+seed_linear -> linear / piecewise linear seed for x0 = 1/d   (replaces the LUT when SEED_MODE = 1 or 2)
+x0 = c0 - c1*d,  best (minimax) line on [a, b] for the relative error |d*x0 - 1|:
+    c1 = 2 / (ab + (a+b)^2/4)      c0 = c1*(a+b)      worst error = (b-a)^2 / ((a+b)^2 + 4ab)
+PWL = 0 : one line on [0.5, 1)  -> x0 = 48/17 - 32/17*d, error 1/17   (4.09 bits, same as the 8 entry LUT)
+PWL = 1 : 8 lines, segment = d[29:27] = mb[22:20] (same index as the LUT), error ~2^-9.17
+          -> 9.15 bits after the 16 bit truncation (checked on all 2^23 mantissas in the model), so 2 NR iterations are enough
+
+Q formats
+    d   : Q1.31, only d[30:15] is used (Q0.16, d[31] is always 0, d[30] is the hidden 1)
+    c1  : Q2.14 (16 bit, max 3.55)
+    c1*d: Q2.14 * Q0.16 = Q2.30, straight from vedic_16x16, no shift needed (value < 2)
+    c0  : Q2.30 (max 3.77, fits below 4)
+    x0  : c0 - c1*d through sub32, Q2.30
+combinational (gate level multiplier + CLA subtractor), so it needs no extra FSM cycle
+*/
+
+module seed_linear (
+    input  wire [31:0] d,  // Q1.31 divisor, in [0.5, 1)
+    output wire [31:0] x0  // Q2.30 seed
+);
+    parameter PWL = 1; // 0 -> single line, 1 -> 8 segment piecewise linear
+
+    reg [31:0] c0_t; // Q2.30, 8 segment table
+    reg [15:0] c1_t; // Q2.14
+
+    always @(*) begin
+        case (d[29:27])
+            3'd0: begin c0_t = 32'hF15BD72F; c1_t = 16'hE329; end  // [0.5000, 0.5625)  3.77123 - 3.54938 d
+            3'd1: begin c0_t = 32'hD7E0C127; c1_t = 16'hB5CB; end  // [0.5625, 0.6250)  3.37309 - 2.84052 d
+            3'd2: begin c0_t = 32'hC344DE01; c1_t = 16'h94C7; end  // [0.6250, 0.6875)  3.05108 - 2.32465 d
+            3'd3: begin c0_t = 32'hB2416483; c1_t = 16'h7C01; end  // [0.6875, 0.7500)  2.78524 - 1.93756 d
+            3'd4: begin c0_t = 32'hA3F89F0D; c1_t = 16'h68F1; end  // [0.7500, 0.8125)  2.56205 - 1.63971 d
+            3'd5: begin c0_t = 32'h97CECD93; c1_t = 16'h59F6; end  // [0.8125, 0.8750)  2.37200 - 1.40564 d
+            3'd6: begin c0_t = 32'h8D534D84; c1_t = 16'h4DF9; end  // [0.8750, 0.9375)  2.20821 - 1.21832 d
+            3'd7: begin c0_t = 32'h8432A3EA; c1_t = 16'h443B; end  // [0.9375, 1.0000)  2.06559 - 1.06610 d
+        endcase
+    end
+
+    wire [31:0] c0 = (PWL == 0) ? 32'hB4B4B4B5 : c0_t; // single line: 48/17 = 2.82353
+    wire [15:0] c1 = (PWL == 0) ? 16'h7878     : c1_t; //              32/17 = 1.88232
+
+    wire [31:0] cd; // c1 * d, Q2.30
+    vedic_16x16 u_mul (.a(c1), .b(d[30:15]), .p(cd));
+    sub32 u_sub (.a(c0), .b(cd), .diff(x0), .borrow());
+endmodule
+
+
+`timescale 1ns/1ps
+
+/*
+rsqrt_lut -> look-up-table for the square root seed y0 ~ 1/sqrt(x)
+x is the range reduced radicand (Q1.31), it depends on the parity of the exponent:
+    idx[3] = ea[0] = 0 -> E = ea-127 odd  -> x = m/2 in [0.5, 1)    8 segments of width 1/16
+    idx[3] = ea[0] = 1 -> E = ea-127 even -> x = m/4 in [0.25, 0.5) 8 segments of width 1/32
+idx[2:0] = top 3 fraction bits of A (frac[22:20])
+each entry = 2/(sqrt(lo) + sqrt(hi)) -> same error at both ends of the segment (minimax)
+gives ~5.09 correct bits (worst segment [0.25, 0.28125))
+*/
+
+module rsqrt_lut (
+    input  wire [3:0]  idx,
+    output reg  [31:0] y0  // Q2.30
+);
+    always @(*) begin
+        case (idx)
+            4'd0:  y0 = 32'h57D86660;  // [0.5000, 0.5625)   1.37258
+            4'd1:  y0 = 32'h53160EB7;  // [0.5625, 0.6250)   1.29822
+            4'd2:  y0 = 32'h4F069649;  // [0.6250, 0.6875)   1.23478
+            4'd3:  y0 = 32'h4B821517;  // [0.6875, 0.7500)   1.17982
+            4'd4:  y0 = 32'h486C1702;  // [0.7500, 0.8125)   1.13160
+            4'd5:  y0 = 32'h45AFB342;  // [0.8125, 0.8750)   1.08885
+            4'd6:  y0 = 32'h433D27FA;  // [0.8750, 0.9375)   1.05061
+            4'd7:  y0 = 32'h410853AC;  // [0.9375, 1.0000)   1.01613
+            4'd8:  y0 = 32'h7C3B6670;  // [0.25000, 0.28125) 1.94113
+            4'd9:  y0 = 32'h7580675C;  // [0.28125, 0.31250) 1.83596
+            4'd10: y0 = 32'h6FC25EDE;  // [0.31250, 0.34375) 1.74624
+            4'd11: y0 = 32'h6AC8DD5A;  // [0.34375, 0.37500) 1.66851
+            4'd12: y0 = 32'h666BA585;  // [0.37500, 0.40625) 1.60032
+            4'd13: y0 = 32'h628D2560;  // [0.40625, 0.43750) 1.53987
+            4'd14: y0 = 32'h5F171432;  // [0.43750, 0.46875) 1.48578
+            4'd15: y0 = 32'h5BF84A24;  // [0.46875, 0.50000) 1.43703
+        endcase
+    end
+endmodule
+
+
+`timescale 1ns/1ps
+
+/*
 fp_unpack -> split IEEE754 single precision into {sign, exponent, 24bit mantissa}
              and classify the operand
 STAGE 3: special case detection added (zero, subnormal, infinity, NaN)
@@ -79,6 +167,7 @@ module fp_unpack (
     output wire        sign,
     output wire [7:0]  exp,
     output wire [23:0] mant,     // {hidden, fraction}, value = mant / 2^23, in [1,2) for normals
+    // STAGE 3: operand classification
     output wire        is_zero,
     output wire        is_sub,
     output wire        is_inf,
@@ -87,6 +176,7 @@ module fp_unpack (
     assign sign = x[31];
     assign exp  = x[30:23];
 
+    // STAGE 3: classification + correct hidden bit
     wire exp_zero  = ~|x[30:23];   // exponent all 0s
     wire exp_ones  =  &x[30:23];   // exponent all 1s
     wire frac_zero = ~|x[22:0];
@@ -145,6 +235,69 @@ endmodule
 
 `timescale 1ns/1ps
 
+/*
+sqrt_pack -> exact rounding + pack for the square root
+root = x*y in [0.5, 1), q = its top 24 bits (truncated), that is the mantissa 1.xxx before rounding
+true root scaled like q: S = sqrt(x) * 2^24, so S^2 = x * 2^48, compare it with the midpoint q + 1/2:
+    S > q + 1/2   <=>   4*x*2^48 > (2q+1)^2       (both are integers, never equal -> no ties in sqrt)
+the shared multiplier makes (2q+1)^2 in S_OUT, chk = {q, 1} = 2q+1 goes out to it
+4*x*2^48 = x_q131 * 2^19 has its low 25 bits = 0 and (2q+1)^2 is odd, so comparing bits [49:25] is enough:
+    round_up = (sq[49:25] < x[30:6])  -> borrow of sub32
+this needs |hw root - true root| < 1/2 ULP, true with >= 3 NR iterations (all 2^24 cases checked in the model)
+exponent : biased result = (ea + 127) >> 1   (ea odd -> E even, ea even -> E odd, the >>1 does the floor)
+no overflow / underflow possible for sqrt
+*/
+
+module sqrt_pack (
+    input  wire [7:0]  exp_a,   // biased exponent of A
+    input  wire [31:0] x,       // Q1.31 radicand (m/4 or m/2)
+    input  wire [23:0] q,       // truncated root mantissa
+    input  wire [24:0] sq_hi,   // (2q+1)^2 bits [49:25], from the shared multiplier
+    output wire [24:0] chk,     // 2q+1, to the shared multiplier
+    output wire [31:0] result
+);
+    assign chk = {q, 1'b1}; // 2q + 1
+
+    wire round_up; // borrow = 1 when sq_hi < x[30:6]
+    sub32 u_sub (.a({7'd0, sq_hi}), .b({7'd0, x[30:6]}), .diff(), .borrow(round_up));
+
+    wire [24:0] mant  = {1'b0, q} + round_up;
+    wire carry = mant[24];  // 1.111..1 rounded up -> 10.000..0
+    wire [8:0]  esum  = {1'b0, exp_a} + 9'd127;
+    wire [7:0]  exp_f = esum[8:1] + carry;
+    wire [22:0] frac  = carry ? 23'd0 : mant[22:0];
+
+    assign result = {1'b0, exp_f, frac};
+endmodule
+
+
+`timescale 1ns/1ps
+
+/*
+conv_monitor -> residual based convergence monitor
+e = d*x (divide) or x*y*y (sqrt) is already made by the shared multiplier, ~1.0 in Q2.30
+r = e - 1.0 is the current relative error (two's complement, through sub32)
+|r| < 2^-k  <=>  bits r[31:30-k] are all 0s (small positive) or all 1s (small negative)
+conv   : |r| < 2^-15 -> the error squares every iteration, so after THIS update x is ~2^-30 good,
+         this iteration can be the last one (no extra cycle needed)
+res_ok : |r| < 2^-26 -> used on the final x as a fault check (fault free runs stay below ~2^-30)
+*/
+
+module conv_monitor (
+    input  wire [31:0] e,      // Q2.30, ~1.0
+    output wire conv,          // |e - 1| < 2^-15
+    output wire res_ok         // |e - 1| < 2^-26
+);
+    wire [31:0] r; // e - 1.0
+    sub32 u_sub (.a(e), .b(32'h4000_0000), .diff(r), .borrow());
+
+    assign conv   = (~|r[31:15]) | (&r[31:15]);
+    assign res_ok = (~|r[31:4])  | (&r[31:4]);
+endmodule
+
+
+`timescale 1ns/1ps
+
 // Datapath (all unsigned fixed point, ONE shared 32x32 multiplier, FSM-sequenced)
 //   d  : Q1.31   (= {mant_B, 7'b0})
 //   x  : Q2.30   (1.0 = 32'h4000_0000, 2.0 = 32'h8000_0000)
@@ -157,11 +310,21 @@ endmodule
 //   S_OUT: normalise / round / pack, raise 'done' for one cycle
 // STAGE 3: special operands (NaN / Inf / zero / subnormal) bypass the NR loop:
 //   IDLE --start & special--> IDLE   (result + done on the next clock edge, 1 cycle latency)
+// STAGE 4: seed modes, convergence monitor, square root, fault injection
+// STAGE 4: op = 1 -> square root of a, same registers reused:  d_r = x (radicand), x_r = y ~ 1/sqrt(x)
+//   IDLE -> (S_Y2 -> S_XY2 -> S_YT) x num_iter -> S_SQ -> S_OUT -> IDLE
+//   S_Y2 : e = y * y
+//   S_XY2: e = x * (y*y)            (residual for the monitor)
+//   S_YT : y = y * (3 - x*y*y) / 2  (the /2 is a one bit bigger shift)
+//   S_SQ : root = x * y
+//   S_OUT: exact rounding check (2q+1)^2 vs 4x on the shared multiplier, pack
+// STAGE 4: auto_stop = 1 -> conv_monitor checks |1 - e| < 2^-15 in S_E / S_XY2, if yes this is the last iteration
+// STAGE 4: S_OUT of a divide also computes d*x on the (free) multiplier -> fault_det if |1 - d*x| >= 2^-26
 
 /*
 fp_div -> IEEE754 single-precision divider using Newton Raphson reciprocal.
 Required ans = A * (1/B)
-Newton-Raphson iteration : x(n+1) = x(n) * (2-d*x(n))       
+Newton-Raphson iteration : x(n+1) = x(n) * (2-d*x(n))
                             : d -> normalised mantissa (mantissa of B/2) in [0.5, 1)
 
 STAGE 3: special cases handled (priority order, top wins)
@@ -173,6 +336,11 @@ STAGE 3: special cases handled (priority order, top wins)
    sign of Inf / zero results = signA ^ signB
 Subnormal inputs are treated as zero (DAZ) and subnormal results are flushed to zero (FTZ).
 
+STAGE 4: the module now ALSO does square root (op = 1), name kept as fp_div so nothing else breaks
+Newton-Raphson for 1/sqrt : y(n+1) = y(n) * (3 - x*y(n)^2) / 2,   sqrt(x) = x * y   (no division needed)
+   A = m * 2^E,  E even -> x = m/4 in [0.25, 0.5),  E odd -> x = m/2 in [0.5, 1)
+   sqrt special cases: NaN -> NaN (quietened), -x -> 0x7FC00000 (invalid), +-0 -> +-0,
+                       +Inf -> +Inf, subnormal -> +-0 (DAZ), no overflow / underflow possible
 */
 
 module fp_div (
@@ -182,17 +350,32 @@ module fp_div (
     input  wire [31:0] a, // dividend
     input  wire [31:0] b, // divisor
     input  wire [2:0]  num_iter, // number of newton-raphson iterations (0..7)
+    // STAGE 4: operation select + convergence monitor enable
+    input  wire op,        // 0 -> a / b,  1 -> sqrt(a)  (b is ignored)
+    input  wire auto_stop, // 1 -> stop when the residual is small, num_iter is then the max
     output reg  [31:0] result,
     output reg done, // 1-cycle pulse, result valid
     output wire busy,
+    // STAGE 3: IEEE exception flags, valid together with 'done'
     output reg  [3:0]  flags, // {invalid, div_by_zero, overflow, underflow}
     // debug or analysis
     output wire [31:0] x_dbg, // current reciprocal estimate, for convergence monitoring
-    output wire [2:0]  iter_dbg
+    // STAGE 4: monitor outputs + residual fault check
+    output wire [2:0]  iter_dbg,
+    output wire [2:0]  iters_used, // iterations actually done, valid with done
+    output reg  converged,         // 1 -> the monitor stopped the loop before num_iter
+    output reg  fault_det          // 1 -> divide result failed the final |1 - d*x| < 2^-26 check
 );
-    localparam IDLE = 3'd0, S_E = 3'd1, S_X = 3'd2, S_Q = 3'd3, S_OUT = 3'd4;
+    // STAGE 4: seed select + 4 bit state for the sqrt states
+    parameter SEED_MODE = 0; // 0 -> seed_lut (stage 3), 1 -> single line, 2 -> piecewise linear (8 segments)
 
-    reg [2:0]  state;
+    localparam IDLE = 4'd0, S_E = 4'd1, S_X = 4'd2, S_Q = 4'd3, S_OUT = 4'd4;
+    localparam S_Y2 = 4'd5, S_XY2 = 4'd6, S_YT = 4'd7, S_SQ = 4'd8; // sqrt
+
+    reg [3:0]  state;
+    reg op_r;          // 1 -> current job is a sqrt
+    reg conv_r;        // monitor result of this iteration
+    reg [23:0] root_r; // truncated sqrt mantissa
     reg [2:0]  iter;
     reg sign_r;
     reg [7:0]  ea_r, eb_r;
@@ -203,11 +386,13 @@ module fp_div (
     assign busy = (state != IDLE);
     assign x_dbg = x_r;
     assign iter_dbg = iter;
+    assign iters_used = iter; // STAGE 4
 
     // unpack the combination on input porta
     wire sa, sb;
     wire [7:0]  ea, eb;
     wire [23:0] ma, mb;
+    // STAGE 3: operand classification + special-case result
     wire za, suba, infa, nana;
     wire zb, subb, infb, nanb;
     fp_unpack u_a (.x(a), .sign(sa), .exp(ea), .mant(ma),
@@ -235,25 +420,61 @@ module fp_div (
                               r_inf ? {s_q, 8'hFF, 23'd0} :
                                       {s_q, 31'd0};
 
+    // STAGE 4: sqrt special cases (only A is used)
+    wire sq_special = nana | a_zero | infa | sa;               // anything but a positive normal
+    wire sq_invalid = (nana & ~a[22]) | (sa & ~a_zero & ~nana); // sNaN, sqrt(negative)
+    wire [31:0] sq_special_val = nana   ? {a[31:23], 1'b1, a[21:0]} : // NaN propagated (quietened)
+                                 a_zero ? {sa, 31'd0} :               // +-0 (subnormal -> DAZ)
+                                 sa     ? 32'h7FC0_0000 :             // sqrt(negative) -> default NaN
+                                          32'h7F80_0000;              // sqrt(+Inf) = +Inf
+
     // get the x0 from look up table
     wire [31:0] x0;
-    seed_lut u_lut (.idx(mb[22:20]), .x0(x0));
+    // STAGE 4: seed picked by SEED_MODE
+    generate
+        if (SEED_MODE == 0) begin : g_lut
+            seed_lut u_lut (.idx(mb[22:20]), .x0(x0));
+        end else begin : g_lin
+            seed_linear #(.PWL(SEED_MODE == 2)) u_lin (.d({1'b0, mb, 7'b0}), .x0(x0));
+        end
+    endgenerate
+
+    // sqrt: range reduced radicand (by exponent parity) and its 1/sqrt seed
+    wire [31:0] xs = ea[0] ? {2'b00, ma, 6'b0}   // ea odd  -> E even -> x = m/4, Q1.31
+                           : {1'b0,  ma, 7'b0};  // ea even -> E odd  -> x = m/2
+    wire [31:0] y0;
+    rsqrt_lut u_rlut (.idx({ea[0], ma[22:20]}), .y0(y0));
 
     // using the standard multiplyier that is the there for the project
+    // STAGE 3: 2 - e through the gate-level subtractor
     wire [31:0] t_w; // 2 - e
-    sub32 u_sub (.a(32'h8000_0000), .b(e_r), .diff(t_w), .borrow());
+    // STAGE 4: same subtractor makes 3 - x*y*y for sqrt
+    sub32 u_sub (.a(op_r ? 32'hC000_0000 : 32'h8000_0000), .b(e_r), .diff(t_w), .borrow()); // 2 - e  or  3 - x*y*y
     reg  [31:0] mul_a, mul_b;
     wire [63:0] mul_p;
+    wire [24:0] chk_w; // STAGE 4: 2q+1 for the sqrt rounding check
 
+    // STAGE 4: sqrt states, S_OUT uses the multiplier for the checks
     always @(*) begin
         case (state)
-            S_E:     begin mul_a = d_r;            mul_b = x_r; end
-            S_X:     begin mul_a = x_r;            mul_b = t_w; end
-            S_Q:     begin mul_a = {8'b0, ma_r};   mul_b = x_r; end
-            default: begin mul_a = 32'd0;          mul_b = 32'd0; end
+            S_E, S_SQ: begin mul_a = d_r;            mul_b = x_r; end  // d*x  or  x*y
+            S_X, S_YT: begin mul_a = x_r;            mul_b = t_w; end  // x*(2-e)  or  y*(3-x*y*y)
+            S_Q:       begin mul_a = {8'b0, ma_r};   mul_b = x_r; end
+            S_Y2:      begin mul_a = x_r;            mul_b = x_r; end  // y*y
+            S_XY2:     begin mul_a = d_r;            mul_b = e_r; end  // x*(y*y)
+            S_OUT:     begin mul_a = op_r ? {7'b0, chk_w} : d_r;       // (2q+1)^2  or  d*x (residual)
+                             mul_b = op_r ? {7'b0, chk_w} : x_r; end
+            default:   begin mul_a = 32'd0;          mul_b = 32'd0; end
         endcase
     end
     mant_mul u_mul (.a(mul_a), .b(mul_b), .p(mul_p));
+
+    // STAGE 4: convergence monitor + loop exit
+    wire conv_w, res_ok_w;
+    conv_monitor u_mon (.e(mul_p[62:31]), .conv(conv_w), .res_ok(res_ok_w)); // e = d*x or x*y*y
+
+    wire last_w  = ((iter + 3'd1) == num_iter);   // cap reached
+    wire early_w = auto_stop & conv_r & ~last_w;  // monitor says this update is good enough
 
     // round to required bits and pack
     wire signed [9:0] exp_base = $signed({2'b00, ea_r}) - $signed({2'b00, eb_r}) + 10'sd127;
@@ -261,6 +482,35 @@ module fp_div (
     wire        ovf_w, unf_w;
     fp_round_pack u_rp (.sign(sign_r), .exp_base(exp_base), .prod(prod_r),
                         .result(res_w), .overflow(ovf_w), .underflow(unf_w));
+
+    // STAGE 4: sqrt exact rounding + pack
+    wire [31:0] sq_res_w;
+    sqrt_pack u_sp (.exp_a(ea_r), .x(d_r), .q(root_r), .sq_hi(mul_p[49:25]),
+                    .chk(chk_w), .result(sq_res_w));
+
+    // STAGE 4: fault injection, simulation only (iverilog -DFAULT_INJ ...)
+    // the testbench sets dut.fi_en / fi_sel / fi_iter / fi_bit, one bit is flipped while the register is written
+    // fi_sel : 0 = x, 1 = e, 2 = d, 3 = mant_A, 4 = prod      (divide only)
+    // fi_iter: x -> x_k (k=0 is the seed, k = value after the k-th iteration),  e -> e of iteration k (= d*x_k)
+    //          d, mant_A, prod are written once, fi_iter is not used for them
+`ifdef FAULT_INJ
+    reg fi_en;
+    reg [2:0] fi_sel, fi_iter;
+    reg [5:0] fi_bit;
+    initial begin fi_en = 1'b0; fi_sel = 3'd0; fi_iter = 3'd0; fi_bit = 6'd0; end
+
+    wire [63:0] fi_m = 64'd1 << fi_bit;
+    wire [2:0]  fi_k = (state == IDLE) ? 3'd0 : iter + 3'd1; // index of the x being written
+    wire [31:0] fi_x = (fi_en && fi_sel == 3'd0 && fi_iter == fi_k) ? fi_m[31:0] : 32'd0;
+    wire [31:0] fi_e = (fi_en && fi_sel == 3'd1 && fi_iter == iter) ? fi_m[31:0] : 32'd0;
+    wire [31:0] fi_d = (fi_en && fi_sel == 3'd2) ? fi_m[31:0] : 32'd0;
+    wire [23:0] fi_a = (fi_en && fi_sel == 3'd3) ? fi_m[23:0] : 24'd0;
+    wire [55:0] fi_p = (fi_en && fi_sel == 3'd4) ? fi_m[55:0] : 56'd0;
+`else
+    wire [31:0] fi_x = 32'd0, fi_e = 32'd0, fi_d = 32'd0; // normal build: no fault, XOR with 0
+    wire [23:0] fi_a = 24'd0;
+    wire [55:0] fi_p = 56'd0;
+`endif
 
     // controlling the cycles [FSM (Finite state machine)]
     always @(posedge clk) begin
@@ -270,44 +520,77 @@ module fp_div (
             result <= 32'd0;
             iter   <= 3'd0;
             flags  <= 4'd0;   // STAGE 3
+            op_r      <= 1'b0;
+            conv_r    <= 1'b0;
+            converged <= 1'b0;
+            fault_det <= 1'b0;
         end else begin
             done <= 1'b0;
             case (state)
+                // STAGE 3: special operands answered directly from IDLE
+                // STAGE 4: sqrt start (op = 1), fault injection on the loaded registers
                 IDLE: if (start) begin
-                    if (special) begin
-                        result <= special_val;
-                        flags  <= {invalid_w, dbz_w, 2'b00};
+                    op_r      <= op;
+                    iter      <= 3'd0;
+                    converged <= 1'b0;
+                    fault_det <= 1'b0;
+                    if (op ? sq_special : special) begin
+                        result <= op ? sq_special_val : special_val;
+                        flags  <= op ? {sq_invalid, 3'b000} : {invalid_w, dbz_w, 2'b00};
                         done   <= 1'b1;
                         state  <= IDLE;
                     end else begin
                         sign_r <= s_q;
                         ea_r   <= ea;
                         eb_r   <= eb;
-                        ma_r   <= ma;
-                        d_r    <= {mb, 7'b0};
-                        x_r    <= x0;
-                        iter   <= 3'd0;
-                        state  <= (num_iter == 3'd0) ? S_Q : S_E;
+                        ma_r   <= ma ^ fi_a;
+                        d_r    <= op ? xs : ({mb, 7'b0} ^ fi_d);
+                        x_r    <= op ? y0 : (x0 ^ fi_x);
+                        state  <= (num_iter == 3'd0) ? (op ? S_SQ : S_Q) : (op ? S_Y2 : S_E);
                     end
                 end
+                // STAGE 4: monitor in S_E, early exit in S_X, fault injection
                 S_E: begin
-                    e_r   <= mul_p[62:31];
-                    state <= S_X;
+                    e_r    <= mul_p[62:31] ^ fi_e;
+                    conv_r <= conv_w;
+                    state  <= S_X;
                 end
                 S_X: begin
-                    x_r   <= mul_p[61:30];
-                    iter  <= iter + 3'd1;
-                    state <= ((iter + 3'd1) == num_iter) ? S_Q : S_E;
+                    x_r       <= mul_p[61:30] ^ fi_x;
+                    iter      <= iter + 3'd1;
+                    converged <= early_w;
+                    state     <= (early_w | last_w) ? S_Q : S_E;
                 end
                 S_Q: begin
-                    prod_r <= mul_p[55:0];
+                    prod_r <= mul_p[55:0] ^ fi_p;
+                    state  <= S_OUT;
+                end
+                // sqrt
+                S_Y2: begin
+                    e_r   <= mul_p[61:30];     // y*y, Q2.30
+                    state <= S_XY2;
+                end
+                S_XY2: begin
+                    e_r    <= mul_p[62:31];    // x*y*y, Q2.30, ~1.0
+                    conv_r <= conv_w;
+                    state  <= S_YT;
+                end
+                S_YT: begin
+                    x_r       <= mul_p[62:31]; // y*t/2, Q2.30
+                    iter      <= iter + 3'd1;
+                    converged <= early_w;
+                    state     <= (early_w | last_w) ? S_SQ : S_Y2;
+                end
+                S_SQ: begin
+                    root_r <= mul_p[60:37];    // x*y is Q3.61 in [0.5, 1), top 24 bits
                     state  <= S_OUT;
                 end
                 S_OUT: begin
-                    result <= res_w;
-                    flags  <= {2'b00, ovf_w, unf_w};   // STAGE 3
-                    done   <= 1'b1;
-                    state  <= IDLE;
+                    result    <= op_r ? sq_res_w : res_w;
+                    flags     <= op_r ? 4'd0 : {2'b00, ovf_w, unf_w};   // STAGE 3
+                    fault_det <= ~op_r & ~res_ok_w;
+                    done      <= 1'b1;
+                    state     <= IDLE;
                 end
                 default: state <= IDLE;
             endcase
@@ -362,14 +645,10 @@ module cla8 (
     assign c[2] = g[1] | (p[1] & g[0]) | (&p[1:0] & cin);
     assign c[3] = g[2] | (p[2] & g[1]) | (&p[2:1] & g[0]) | (&p[2:0] & cin);
     assign c[4] = g[3] | (p[3] & g[2]) | (&p[3:2] & g[1]) | (&p[3:1] & g[0]) | (&p[3:0] & cin);
-    assign c[5] = g[4] | (p[4] & g[3]) | (&p[4:3] & g[2]) | (&p[4:2] & g[1]) | (&p[4:1] & g[0])
-                | (&p[4:0] & cin);
-    assign c[6] = g[5] | (p[5] & g[4]) | (&p[5:4] & g[3]) | (&p[5:3] & g[2]) | (&p[5:2] & g[1])
-                | (&p[5:1] & g[0]) | (&p[5:0] & cin);
-    assign c[7] = g[6] | (p[6] & g[5]) | (&p[6:5] & g[4]) | (&p[6:4] & g[3]) | (&p[6:3] & g[2])
-                | (&p[6:2] & g[1]) | (&p[6:1] & g[0]) | (&p[6:0] & cin);
-    assign c[8] = g[7] | (p[7] & g[6]) | (&p[7:6] & g[5]) | (&p[7:5] & g[4]) | (&p[7:4] & g[3])
-                | (&p[7:3] & g[2]) | (&p[7:2] & g[1]) | (&p[7:1] & g[0]) | (&p[7:0] & cin);
+    assign c[5] = g[4] | (p[4] & g[3]) | (&p[4:3] & g[2]) | (&p[4:2] & g[1]) | (&p[4:1] & g[0])| (&p[4:0] & cin);
+    assign c[6] = g[5] | (p[5] & g[4]) | (&p[5:4] & g[3]) | (&p[5:3] & g[2]) | (&p[5:2] & g[1])| (&p[5:1] & g[0]) | (&p[5:0] & cin);
+    assign c[7] = g[6] | (p[6] & g[5]) | (&p[6:5] & g[4]) | (&p[6:4] & g[3]) | (&p[6:3] & g[2])| (&p[6:2] & g[1]) | (&p[6:1] & g[0]) | (&p[6:0] & cin);
+    assign c[8] = g[7] | (p[7] & g[6]) | (&p[7:6] & g[5]) | (&p[7:5] & g[4]) | (&p[7:4] & g[3])| (&p[7:3] & g[2]) | (&p[7:2] & g[1]) | (&p[7:1] & g[0]) | (&p[7:0] & cin);
 
     assign sum  = p ^ c[7:0];
     assign cout = c[8];
