@@ -1,4 +1,3 @@
-// STAGE 4 - NEW FILE
 `timescale 1ns/1ps
 // Fault injection campaign for fp_div (simulation only), needs -DFAULT_INJ:
 //   iverilog -g2005 -DFAULT_INJ -o fault.out ../register-level-modules/*.v ../testbench/tb_fault.v && vvp fault.out

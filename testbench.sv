@@ -1,9 +1,7 @@
 // combined testbench
-// STAGE 4: seed modes, convergence monitor, sqrt, fault injection
 
 `timescale 1ns/1ps
 // Error is measured as ULP distance between given and the expected result.
-// STAGE 4: new plusargs / parameter
 //   +ITER=n      number of NR iterations (max when +AUTO=1)          default 3
 //   +AUTO=0/1    convergence monitor off / on                        default 0
 //   +OP=0/1      0 -> divide (vectors.hex), 1 -> sqrt (vectors_sqrt.hex, or +SQRT_VEC=<file>)
@@ -21,12 +19,11 @@ module tb_fp_div;
     wire [31:0] result, x_dbg;
     wire done, busy;
     wire [2:0]  iter_dbg;
-    wire [3:0]  flags;   // STAGE 3: {invalid, div_by_zero, overflow, underflow}
+    wire [3:0]  flags;
     reg  op = 0, auto_stop = 0;
     wire [2:0] iters_used;
     wire converged, fault_det;
 
-    // STAGE 4: SEED_MODE parameter + new ports
     fp_div #(.SEED_MODE(SEED_MODE)) dut (.clk(clk),
                 .rst(rst),
                 .start(start),
@@ -54,7 +51,6 @@ module tb_fp_div;
     reg [31:0] exp_q;
     reg [31:0] last_x;
 
-    // STAGE 4: sqrt vectors, statistics, csv files
     reg [63:0] svec [0:SQRT_COUNT-1];
     reg [8*64:1] sqrt_file;
     integer ops, autos, csv, f_res, f_conv;
@@ -62,7 +58,6 @@ module tb_fp_div;
     integer lat_min, lat_max, lat_sum, n_conv, n_fdet;
     real xr, dr, resid;
 
-    // STAGE 3: directed special-case vectors {A, B, expected result, expected flags}
     localparam integer NSPEC = 25;
     reg [99:0] spec [0:NSPEC-1];
     integer k, n_spec_fail;
@@ -96,7 +91,6 @@ module tb_fp_div;
         spec[24] = {32'h0DA2_4260, 32'h7149_F2CA, 32'h0000_0000, 4'b0001}; // 1e-30 / 1e30 -> +0, underflow (FTZ)
     end
 
-    // STAGE 4: directed sqrt vectors {A, expected result, expected flags}
     localparam integer NSQS = 14;
     reg [67:0] sqs [0:NSQS-1];
     initial begin
@@ -118,7 +112,6 @@ module tb_fp_div;
     end
 
     // print the guess after every NR step (convergence monitoring)
-    // STAGE 4: also log it to conv_log.csv with the residual |1 - d*x| (sqrt: |1 - x*y*y|)
     always @(posedge clk)
         if (busy && n < verbose && x_dbg !== last_x) begin
             $display("      x[%0d] = %h  (%f)", iter_dbg, x_dbg, x_dbg / 1073741824.0);
@@ -142,7 +135,6 @@ module tb_fp_div;
         if (!$value$plusargs("ITER=%d", iters))       iters = 3;
         if (!$value$plusargs("VERBOSE=%d", verbose))   verbose = 10;
         if (!$value$plusargs("RUN=%d", run_limit))     run_limit = MAX_RUN;
-        // STAGE 4: op select, monitor, csv
         if (!$value$plusargs("AUTO=%d", autos))         autos = 0;
         if (!$value$plusargs("OP=%d", ops))             ops = 0;
         if (!$value$plusargs("CSV=%d", csv))            csv = 0;
@@ -177,7 +169,6 @@ module tb_fp_div;
 
         for (n = 0; n < nvec; n = n + 1) begin
             @(negedge clk);
-            // STAGE 4: sqrt vectors are {A, expected}
             if (ops == 0) begin
                 a = vec[n][95:64];  b = vec[n][63:32];  exp_q = vec[n][31:0];
             end else begin
@@ -207,7 +198,6 @@ module tb_fp_div;
             else n_bad = n_bad + 1;
             if (err > max_ulp) max_ulp = err;
 
-            // STAGE 4: iteration histogram, latency, csv
             hist[iters_used] = hist[iters_used] + 1;
             lat_sum = lat_sum + cycles;
             if (cycles < lat_min) lat_min = cycles;
@@ -221,10 +211,8 @@ module tb_fp_div;
                          n, a, b, result, exp_q, err, cycles, (err > 1) ? "<-- MISMATCH" : "");
         end
 
-        // STAGE 3: special-case section (exact bit match + flags + latency)
         $display("\n\t\t\tSpecial cases\n");
         n_spec_fail = 0;
-        // STAGE 4: divide list for op = 0, sqrt list for op = 1
         for (k = 0; k < (ops ? NSQS : NSPEC); k = k + 1) begin
             @(negedge clk);
             if (ops == 0) begin
@@ -255,8 +243,7 @@ module tb_fp_div;
         $display("Exact   : %0d (%f %%)", n_exact, 100.0*n_exact/nvec);
         $display("1 ULP   : %0d (%f %%)", n_1ulp,  100.0*n_1ulp/nvec);
         $display(">1 ULP  : %0d     max ULP error : %0d", n_bad, max_ulp);
-        // STAGE 4: sqrt has its own special list, plus monitor / latency statistics
-        $display("Special : %0d / %0d passed", (ops ? NSQS : NSPEC) - n_spec_fail, ops ? NSQS : NSPEC);   // STAGE 3
+        $display("Special : %0d / %0d passed", (ops ? NSQS : NSPEC) - n_spec_fail, ops ? NSQS : NSPEC);
         $display("Iterations used : 0:%0d 1:%0d 2:%0d 3:%0d 4:%0d 5:%0d 6:%0d 7:%0d   (average %f)",
                  hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7],
                  (1.0*hist[1] + 2*hist[2] + 3*hist[3] + 4*hist[4] + 5*hist[5] + 6*hist[6] + 7*hist[7]) / nvec);

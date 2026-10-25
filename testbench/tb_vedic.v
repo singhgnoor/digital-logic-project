@@ -1,4 +1,3 @@
-// STAGE 3 - NEW FILE
 `timescale 1ns/1ps
 // Checks the Vedic multipliers against the behavioural '*'.
 //   vedic_8x8   : exhaustive (all 65,536 pairs)

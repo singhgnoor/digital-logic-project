@@ -1,19 +1,15 @@
 `timescale 1ns/1ps
 // Error is measured as ULP distance between given and the expected result.
-// STAGE 4 CHANGE START: new plusargs / parameter
 //   +ITER=n      number of NR iterations (max when +AUTO=1)          default 3
 //   +AUTO=0/1    convergence monitor off / on                        default 0
 //   +OP=0/1      0 -> divide (vectors.hex), 1 -> sqrt (vectors_sqrt.hex, or +SQRT_VEC=<file>)
 //   +CSV=1       write results.csv (every vector) and conv_log.csv (every NR step of the first VERBOSE vectors)
 //   seed mode is a parameter (fixed hardware, not a run time choice):  iverilog -Ptb_fp_div.SEED_MODE=2 ...
-// STAGE 4 CHANGE END
 module tb_fp_div;
     localparam integer VECTOR_COUNT = 4000;
     parameter  integer MAX_RUN = 20; // number of iterations to run
-    // STAGE 4 CHANGE START
     localparam integer SQRT_COUNT = 2000;
     parameter  integer SEED_MODE = 0; // 0 = LUT, 1 = line, 2 = piecewise linear
-    // STAGE 4 CHANGE END
 
     reg clk = 0, rst = 1, start = 0;
     reg  [31:0] a, b;
@@ -22,14 +18,10 @@ module tb_fp_div;
     wire done, busy;
     wire [2:0]  iter_dbg;
     wire [3:0]  flags;   // STAGE 3: {invalid, div_by_zero, overflow, underflow}
-    // STAGE 4 CHANGE START
     reg  op = 0, auto_stop = 0;
     wire [2:0] iters_used;
     wire converged, fault_det;
-    // STAGE 4 CHANGE END
 
-    // STAGE 4 CHANGE START: SEED_MODE parameter + new ports
-    // STAGE 3 (old): fp_div dut (.clk(clk), ... .iter_dbg(iter_dbg));
     fp_div #(.SEED_MODE(SEED_MODE)) dut (.clk(clk),
                 .rst(rst),
                 .start(start),
@@ -47,7 +39,6 @@ module tb_fp_div;
                 .iters_used(iters_used),
                 .converged(converged),
                 .fault_det(fault_det));
-    // STAGE 4 CHANGE END
 
     always #5 clk = ~clk;
 
@@ -58,16 +49,13 @@ module tb_fp_div;
     reg [31:0] exp_q;
     reg [31:0] last_x;
 
-    // STAGE 4 CHANGE START: sqrt vectors, statistics, csv files
     reg [63:0] svec [0:SQRT_COUNT-1];
     reg [8*64:1] sqrt_file;
     integer ops, autos, csv, f_res, f_conv;
     integer hist [0:7];
     integer lat_min, lat_max, lat_sum, n_conv, n_fdet;
     real xr, dr, resid;
-    // STAGE 4 CHANGE END
 
-    // STAGE 3 CHANGE START: directed special-case vectors {A, B, expected result, expected flags}
     localparam integer NSPEC = 25;
     reg [99:0] spec [0:NSPEC-1];
     integer k, n_spec_fail;
@@ -100,9 +88,7 @@ module tb_fp_div;
         spec[23] = {32'h7149_F2CA, 32'h0DA2_4260, 32'h7F80_0000, 4'b0010}; // 1e30 / 1e-30 -> +Inf, overflow
         spec[24] = {32'h0DA2_4260, 32'h7149_F2CA, 32'h0000_0000, 4'b0001}; // 1e-30 / 1e30 -> +0, underflow (FTZ)
     end
-    // STAGE 3 CHANGE END
 
-    // STAGE 4 CHANGE START: directed sqrt vectors {A, expected result, expected flags}
     localparam integer NSQS = 14;
     reg [67:0] sqs [0:NSQS-1];
     initial begin
@@ -122,11 +108,8 @@ module tb_fp_div;
         sqs[12] = {32'h407F_FFFF, 32'h3FFF_FFFF, 4'b0000}; // near tie
         sqs[13] = {32'h7F7F_FFFF, 32'h5F7F_FFFF, 4'b0000}; // max float
     end
-    // STAGE 4 CHANGE END
 
     // print the guess after every NR step (convergence monitoring)
-    // STAGE 4 CHANGE START: also log it to conv_log.csv with the residual |1 - d*x| (sqrt: |1 - x*y*y|)
-    // STAGE 3 (old): if (busy && n < verbose && x_dbg !== last_x) begin $display(...); last_x = x_dbg; end
     always @(posedge clk)
         if (busy && n < verbose && x_dbg !== last_x) begin
             $display("      x[%0d] = %h  (%f)", iter_dbg, x_dbg, x_dbg / 1073741824.0);
@@ -145,14 +128,11 @@ module tb_fp_div;
                 $fdisplay(f_conv, "%0d,%0d,%h,%.10f,%e", n, iter_dbg, x_dbg, xr, resid);
             end
         end
-    // STAGE 4 CHANGE END
 
     initial begin
         if (!$value$plusargs("ITER=%d", iters))       iters = 3;
         if (!$value$plusargs("VERBOSE=%d", verbose))   verbose = 10;
         if (!$value$plusargs("RUN=%d", run_limit))     run_limit = MAX_RUN;
-        // STAGE 4 CHANGE START: op select, monitor, csv
-        // STAGE 3 (old): $readmemh("vectors.hex", vec);  (count lines of vec)
         if (!$value$plusargs("AUTO=%d", autos))         autos = 0;
         if (!$value$plusargs("OP=%d", ops))             ops = 0;
         if (!$value$plusargs("CSV=%d", csv))            csv = 0;
@@ -179,7 +159,6 @@ module tb_fp_div;
         $display("Operation = %s   seed mode = %0d   auto_stop = %0d", ops ? "sqrt" : "divide", SEED_MODE, autos);
         for (k = 0; k < 8; k = k + 1) hist[k] = 0;
         lat_min = 1000; lat_max = 0; lat_sum = 0; n_conv = 0; n_fdet = 0;
-        // STAGE 4 CHANGE END
 
         n_exact = 0; n_1ulp = 0; n_bad = 0; max_ulp = 0; lat_first = 0;
         repeat (3) @(posedge clk);
@@ -188,14 +167,11 @@ module tb_fp_div;
 
         for (n = 0; n < nvec; n = n + 1) begin
             @(negedge clk);
-            // STAGE 4 CHANGE START: sqrt vectors are {A, expected}
-            // STAGE 3 (old): a = vec[n][95:64];  b = vec[n][63:32];  exp_q = vec[n][31:0];
             if (ops == 0) begin
                 a = vec[n][95:64];  b = vec[n][63:32];  exp_q = vec[n][31:0];
             end else begin
                 a = svec[n][63:32]; b = 32'd0;          exp_q = svec[n][31:0];
             end
-            // STAGE 4 CHANGE END
             last_x = 32'hx;
             start = 1'b1;
             @(negedge clk);
@@ -220,7 +196,6 @@ module tb_fp_div;
             else n_bad = n_bad + 1;
             if (err > max_ulp) max_ulp = err;
 
-            // STAGE 4 CHANGE START: iteration histogram, latency, csv
             hist[iters_used] = hist[iters_used] + 1;
             lat_sum = lat_sum + cycles;
             if (cycles < lat_min) lat_min = cycles;
@@ -228,27 +203,21 @@ module tb_fp_div;
             if (converged) n_conv = n_conv + 1;
             if (fault_det) n_fdet = n_fdet + 1;
             if (csv) $fdisplay(f_res, "%0d,%h,%h,%h,%h,%0d,%0d,%0d", n, a, b, result, exp_q, err, cycles, iters_used);
-            // STAGE 4 CHANGE END
 
             if (n < verbose || err > 1)
                 $display("[%0d] A=%h B=%h  hw=%h  exp=%h  ULP err=%0d  cycles=%0d %s",
                          n, a, b, result, exp_q, err, cycles, (err > 1) ? "<-- MISMATCH" : "");
         end
 
-        // STAGE 3 CHANGE START: special-case section (exact bit match + flags + latency)
         $display("\n\t\t\tSpecial cases\n");
         n_spec_fail = 0;
-        // STAGE 4 CHANGE START: divide list for op = 0, sqrt list for op = 1
-        // STAGE 3 (old): for (k = 0; k < NSPEC; k = k + 1) begin
         for (k = 0; k < (ops ? NSQS : NSPEC); k = k + 1) begin
             @(negedge clk);
-            // STAGE 3 (old): a = spec[k][99:68];  b = spec[k][67:36];  exp_q = spec[k][35:4];  exp_f = spec[k][3:0];
             if (ops == 0) begin
                 a = spec[k][99:68];  b = spec[k][67:36];  exp_q = spec[k][35:4];  exp_f = spec[k][3:0];
             end else begin
                 a = sqs[k][67:36];   b = 32'd0;           exp_q = sqs[k][35:4];   exp_f = sqs[k][3:0];
             end
-            // STAGE 4 CHANGE END
             start = 1'b1;
             @(negedge clk);
             start = 1'b0;
@@ -266,16 +235,13 @@ module tb_fp_div;
                      k, a, b, result, exp_q, flags, exp_f, cycles,
                      (result !== exp_q || flags !== exp_f) ? "<-- MISMATCH" : "ok");
         end
-        // STAGE 3 CHANGE END
 
         $display("\n\n\t\t\tFinal Results\n");
         $display("Vectors : %0d      NR iterations : %0d      latency : %0d cycles", nvec, iters, lat_first);
         $display("Exact   : %0d (%f %%)", n_exact, 100.0*n_exact/nvec);
         $display("1 ULP   : %0d (%f %%)", n_1ulp,  100.0*n_1ulp/nvec);
         $display(">1 ULP  : %0d     max ULP error : %0d", n_bad, max_ulp);
-        // STAGE 4 CHANGE START: sqrt has its own special list, plus monitor / latency statistics
-        // STAGE 3 (old): $display("Special : %0d / %0d passed", NSPEC - n_spec_fail, NSPEC);   // STAGE 3
-        $display("Special : %0d / %0d passed", (ops ? NSQS : NSPEC) - n_spec_fail, ops ? NSQS : NSPEC);   // STAGE 3
+        $display("Special : %0d / %0d passed", (ops ? NSQS : NSPEC) - n_spec_fail, ops ? NSQS : NSPEC);
         $display("Iterations used : 0:%0d 1:%0d 2:%0d 3:%0d 4:%0d 5:%0d 6:%0d 7:%0d   (average %f)",
                  hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7],
                  (1.0*hist[1] + 2*hist[2] + 3*hist[3] + 4*hist[4] + 5*hist[5] + 6*hist[6] + 7*hist[7]) / nvec);
@@ -285,7 +251,6 @@ module tb_fp_div;
             $fclose(f_res);
             $fclose(f_conv);
         end
-        // STAGE 4 CHANGE END
         $finish;
     end
 endmodule
